@@ -4,7 +4,7 @@
   using internal DACs, with WiFi and ntp sync.
   
   Mauro Pintus , Milano 2018/05/25
-
+  
   How to use it:
   Load this sketch on a ESP32 board using the Arduino IDE 1.8.7
   See Andreas Spiess video linked below if you dont know how to...
@@ -35,19 +35,18 @@
   This is useful to test anything you want to display on the oscilloscope
   to verify the actual points that will be generated.
 
+  Frank Exoo, Den Bosch 2021/03/20
+  Added functionality:
+  - Using the RTC functionality of the ESP32
+  - Support for printing characters
+  - Digital clock
+
   GitHub Repository
-  https://github.com/maurohh/ESP32_OscilloscopeClock
-
-  Twitter Page
-  https://twitter.com/PintusMauro
-
-  Youtube Channel
-  www.youtube.com/channel/UCZ93JYpVb9rEbg5cbcVG_WA/
-
-  Old Web Site
-  www.mauroh.com
+  https://github.com/FrankX0/ESP32_OscilloscopeClock
 
   Credits:
+  Mauro Pintus
+
   Andreas Spiess
   https://www.youtube.com/watch?v=DgaKlh081tU
 
@@ -55,7 +54,7 @@
   https://github.com/SensorsIot/NTPtimeESP
   
   My project is based on this one:
-  http://www.dutchtronix.com/ScopeClock.htm
+  https://github.com/maurohh/ESP32_OscilloscopeClock
   
   Thank you!!
 
@@ -65,10 +64,10 @@
 #include <soc/rtc.h>
 #include <soc/sens_reg.h>
 #include "DataTable.h"
-
+#include <ESP32Time.h>
 
 //#define EXCEL
-//#define NTP
+#define NTP
 
 
 #if defined NTP
@@ -76,8 +75,8 @@
   #include <WiFi.h>
   
   NTPtime NTPch("europe.pool.ntp.org"); // Choose your server pool
-  char *ssid      = "Your SSID";        // Set you WiFi SSID
-  char *password  = "Your PASS";        // Set you WiFi password
+  char *ssid      = "";        // Set you WiFi SSID
+  char *password  = "";        // Set you WiFi password
   
   int status = WL_IDLE_STATUS;
   strDateTime dateTime;
@@ -90,13 +89,10 @@ int m=8;    //Start Minutes
 int s=37;   //Start Seconds
 
 //Variables
-int           lastx,lasty;
-unsigned long currentMillis  = 0;
-unsigned long previousMillis = 0;    
-int           Timeout        = 20;
-const    long interval       = 990; //milliseconds, you should twick this
-                                    //to get a better accuracy
-
+int       lastx,lasty,show;
+int       Timeout = 20;
+byte      xoffset;
+ESP32Time rtc;
 
 //*****************************************************************************
 // PlotTable 
@@ -111,9 +107,9 @@ void PlotTable(byte *SubTable, int SubTableSize, int skip, int opt, int offset)
       if (opt==1) if (SubTable[i]==skip) i++;
     }
     Line(SubTable[i],SubTable[i+1],SubTable[i+2],SubTable[i+3]);  
-    if (opt==2){
-      Line(SubTable[i+2],SubTable[i+3],SubTable[i],SubTable[i+1]); 
-    }
+    //if (opt==2){
+    //  Line(SubTable[i+2],SubTable[i+3],SubTable[i],SubTable[i+1]); 
+    //}
     i=i+2;
     if (SubTable[i+2]==0xFF) break;
   }
@@ -123,6 +119,49 @@ void PlotTable(byte *SubTable, int SubTableSize, int skip, int opt, int offset)
 //*****************************************************************************
 
 
+//*****************************************************************************
+// PlotChar
+//*****************************************************************************
+
+void PlotChar(byte (*SubTable)[112], int Character, byte *XoffsetP, byte Yoffset, byte Size)
+{
+  int i = 2;
+  byte Xoffset = *XoffsetP;
+  *XoffsetP = Xoffset + SubTable[Character-32][1]*Size;
+  int last = SubTable[Character-32][0]*2;
+  while (i < last){
+    if (SubTable[Character-32][i+2]==0xFF){
+      i=i+4;
+    }
+    //delay(5);
+    Line(SubTable[Character-32][i]*Size+Xoffset,SubTable[Character-32][i+1]*Size+Yoffset,SubTable[Character-32][i+2]*Size+Xoffset,SubTable[Character-32][i+3]*Size+Yoffset);  
+    i=i+2;
+  }
+}
+
+// End PlotChar
+//*****************************************************************************
+
+
+//*****************************************************************************
+// PlotText
+//*****************************************************************************
+
+void PlotText(char *Text, byte *Xoffset, byte Yoffset, byte Size)
+{
+  int i,t,last;
+  t = 0;
+  int len = strlen(Text);
+  while (t < len) {
+    //Serial.print(Text[t]);
+      PlotChar(CharData,Text[t],Xoffset,Yoffset,Size);
+    t++;
+  }
+}
+
+// End PlotText
+//*****************************************************************************
+
 
 //*****************************************************************************
 // Dot 
@@ -130,6 +169,7 @@ void PlotTable(byte *SubTable, int SubTableSize, int skip, int opt, int offset)
 
 inline void Dot(int x, int y)
 {
+    x = 254 - x; //mirror
     if (lastx!=x){
       lastx=x;
       dac_output_voltage(DAC_CHANNEL_1, x);
@@ -168,14 +208,14 @@ inline void Dot(int x, int y)
 //*****************************************************************************
 
 
-
 //*****************************************************************************
 // Line 
 //*****************************************************************************
 // Bresenham's Algorithm implementation optimized
 // also known as a DDA - digital differential analyzer
 
-void Line(byte x1, byte y1, byte x2, byte y2)
+void Line(byte x1, byte y1, byte x2, byte y2) //Y-mirrored
+//void Line(byte y1, byte x1, byte y2, byte x2) //CCW-rotated
 {
     int acc;
     // for speed, there are 8 DDA's, one for each octant
@@ -295,7 +335,6 @@ void Line(byte x1, byte y1, byte x2, byte y2)
 //*****************************************************************************
 
 
-
 //*****************************************************************************
 // setup 
 //*****************************************************************************
@@ -358,7 +397,9 @@ void setup()
         byte actualday       = dateTime.day;
         byte actualdayofWeek = dateTime.dayofWeek;
 
-        if (actualHour > 12) actualHour=actualHour-12;
+        //if (actualHour > 12) actualHour=actualHour-12;
+
+        rtc.setTime(actualsecond, actualMinute, actualHour, actualday, actualMonth, actualyear);
         
         h=actualHour;
         m=actualMinute;
@@ -367,7 +408,8 @@ void setup()
       else{
         Serial.println("\nUsing Fix Time");
       }
-    }  
+    }
+    WiFi.mode(WIFI_OFF);  
   #endif    
 
   #if !defined NTP
@@ -389,56 +431,41 @@ void setup()
 //*****************************************************************************
 
 
-
 //*****************************************************************************
 // loop 
 //*****************************************************************************
-
 void loop() {
 
-  currentMillis = millis();
-
-  if (currentMillis - previousMillis >= interval) {
-    previousMillis = currentMillis;
-    s++;
+  s = rtc.getSecond();
+  m = rtc.getMinute();
+  h = rtc.getHour()*5+m/12;
+  
+  show = s / 10;
+  if (show == 0 or show == 2 or show == 4) {
+    // Analog clock
+    PlotTable(DialData,sizeof(DialData),0x00,1,0);
+    PlotTable(DialDigits12,sizeof(DialDigits12),0x00,1,0);
+    PlotTable(HrPtrData, sizeof(HrPtrData), 0xFF,0,9*h);  // 9*h
+    PlotTable(MinPtrData,sizeof(MinPtrData),0xFF,0,9*m);  // 9*m
+    PlotTable(SecPtrData,sizeof(SecPtrData),0xFF,0,5*s);  // 5*s
   }
-  if (s==60) {
-    s=0;
-    m++;
-    if ((m==12)||(m==24)||(m==36)||(m==48)) {
-      h++;
-    }
+  else {
+    // Digital clock
+    offset = 10;
+    char myString[20];
+    sprintf(myString, "%02d:%02d", rtc.getHour(true),rtc.getMinute());
+    PlotText(myString,&offset,140,2);
+    sprintf(myString, ":%02d", rtc.getSecond());
+    PlotText(myString,&offset,140,1);
+    sprintf(myString, "%02d-%02d-%d", rtc.getDay(),rtc.getMonth(),rtc.getYear());
+    //Serial.println(myString);
+    offset = 20;
+    PlotText(myString,&offset,80,1);
   }
-  if (m==60) {
-    m=0;
-    h++;
-  }
-  if (h==60) {
-    h=0;
-  }
-
-  //Optionals
-  //PlotTable(DialDots,sizeof(DialDots),0x00,1,0);
-  //PlotTable(TestData,sizeof(TestData),0x00,0,00); //Full
-  //PlotTable(TestData,sizeof(TestData),0x00,0,11); //Without square
-
-  int i;
-  //Serial.println("Out Ring");                         //2 to back trace
-  //for (i=0; i < 1000; i++) PlotTable(DialData,sizeof(DialData),0x00,2,0);
- 
-  //Serial.println("Diagonals");                        //2 to back trace
-  //for (i=0; i < 2000; i++) PlotTable(DialData,sizeof(DialData),0x00,0,0);
-
-  PlotTable(DialData,sizeof(DialData),0x00,1,0);      //2 to back trace
-  PlotTable(DialDigits12,sizeof(DialDigits12),0x00,1,0);//2 to back trace 
-  PlotTable(HrPtrData, sizeof(HrPtrData), 0xFF,0,9*h);  // 9*h
-  PlotTable(MinPtrData,sizeof(MinPtrData),0xFF,0,9*m);  // 9*m
-  PlotTable(SecPtrData,sizeof(SecPtrData),0xFF,0,5*s);  // 5*s
 
   #if defined EXCEL
     while(1);
   #endif 
-
 }
 
 // End loop 
